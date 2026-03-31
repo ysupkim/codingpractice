@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>사내용 가격 모니터링 MVP</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>사내용 가격 모니터링 MVP</h1>
+
+      {% if use_mock %}
+      <p class="mode-badge mock">현재 실행 모드: <strong>MOCK MODE</strong></p>
+      {% else %}
+      <p class="mode-badge real">현재 실행 모드: <strong>REAL MODE</strong></p>
+      {% endif %}
+
+      <section class="card">
+        <h2>1) 엑셀 업로드</h2>
+        <input id="fileInput" type="file" accept=".xlsx,.xls" />
+        <button id="uploadBtn">업로드</button>
+        <p id="uploadStatus" class="status"></p>
+        <div id="warningsBox"></div>
+      </section>
+
+      <section class="card">
+        <h2>2) 기준 제품 목록</h2>
+        <p>업로드된 제품 개수: <span id="productCount">0</span></p>
+        <table id="productsTable">
+          <thead>
+            <tr><th>품목</th><th>온라인할인가</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>3) 가격 정리</h2>
+        <table id="debugTable">
+          <thead>
+            <tr><th>행 번호</th><th>품목</th><th>원본 가격 값</th><th>정리된 가격 값</th><th>파싱 결과</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>4) 검색 실행</h2>
+        <button id="runSearchBtn">검색 실행</button>
+        <p id="searchStatus" class="status"></p>
+      </section>
+
+      <section class="card">
+        <h2>기준제품명 요약</h2>
+        <ul id="summaryList">
+          <li>문제 결과 있음: 0개 제품</li>
+          <li>API 호출 제한: 0개 제품</li>
+          <li>검색 결과 없음: 0개 제품</li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>검색 디버그 요약</h2>
+        <table id="searchDebugTable">
+          <thead>
+            <tr><th>기준 제품명</th><th>호출 페이지 수</th><th>누적 raw 결과</th><th>최종 통과 개수</th><th>탈락 개수</th><th>비고</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2>5) 결과</h2>
+        <label><input type="checkbox" id="showAll" /> 전체 결과 보기</label>
+        <button id="downloadBtn">엑셀 다운로드</button>
+
+        <table id="resultsTable">
+          <thead>
+            <tr>
+              <th>기준 제품명</th>
+              <th>기준 온라인할인가</th>
+              <th>검색 상품명</th>
+              <th>판매가격</th>
+              <th>쇼핑몰명</th>
+                            <th>링크</th>
+              <th>상태</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
