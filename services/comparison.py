@@ -4,7 +4,7 @@ from typing import Dict, List, Tuple
 
 from providers.base_provider import SearchResult
 from services.excel_reader import BaseProduct
-from services.matcher import evaluate_match
+from services.matcher import ALLOWED_ITEM_PAIR, extract_features, evaluate_match
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,9 @@ class ComparisonDebugInfo:
     passed_count: int = 0
     dropped_count: int = 0
     reasons: Dict[str, int] = field(default_factory=dict)
+    evaluated_candidate_count: int = 0
+    fallback_used: bool = False
+    reranked_top_titles: List[str] = field(default_factory=list)
 
 
 def _add_reason(info: ComparisonDebugInfo, reason: str):
@@ -42,20 +45,60 @@ def compare_product_with_results(
 ) -> Tuple[List[ComparisonResult], ComparisonDebugInfo]:
     compared: List[ComparisonResult] = []
     debug = ComparisonDebugInfo(raw_count=len(search_results))
-    candidates = search_results
-    fallback_candidates: List[SearchResult] = []
-    # 실행 완료 보장을 위해 평가 대상 상한 적용 (정확도보다 속도 우선)
-    if max_evaluation_candidates is not None and max_evaluation_candidates > 0:
-        candidates = search_results[:max_evaluation_candidates]
-        skipped = len(search_results) - len(candidates)
-        if skipped > 0:
-            _add_reason(debug, f"후보 상한으로 {skipped}건 생략")
-            # 앞쪽 후보에서 모두 탈락하면 뒤쪽 후보를 추가로 보는 fallback (미탐 완화)
-            fallback_limit = max(max_evaluation_candidates, 10)
-            fallback_candidates = search_results[max_evaluation_candidates : max_evaluation_candidates + fallback_limit]
 
-    def _evaluate(items: List[SearchResult]):
+    FULL_EVALUATION_THRESHOLD = 50
+    base_features = extract_features(base.name)
+    evaluated_links = set()
+
+    def _relevance(item: SearchResult, idx: int) -> float:
+        cand = extract_features(item.title)
+        score = 0.0
+
+        if cand.hard_negative_tokens:
+            score -= 5.0
+
+        if base_features.design_candidate_tokens and cand.design_candidate_tokens:
+            if base_features.design_candidate_tokens & cand.design_candidate_tokens:
+                score += 3.0
+
+        if base_features.item_type_tokens and cand.item_type_tokens:
+            if base_features.item_type_tokens & cand.item_type_tokens:
+                score += 2.5
+            else:
+                for b in base_features.item_type_tokens:
+                    for c in cand.item_type_tokens:
+                        if (b, c) in ALLOWED_ITEM_PAIR:
+                            score += 2.0
+                            break
+
+        if base_features.piece_counts and cand.piece_counts and (base_features.piece_counts & cand.piece_counts):
+            score += 2.0
+        if base_features.person_counts and cand.person_counts and (base_features.person_counts & cand.person_counts):
+            score += 1.5
+        if base_features.shape_tokens and cand.shape_tokens and (base_features.shape_tokens & cand.shape_tokens):
+            score += 1.0
+
+        # tie-break: 원래 순서 가중치(앞쪽 소폭 우선)
+        score += max(0.0, 0.001 * (1000 - idx))
+        return score
+
+    ranked_candidates = search_results
+    if len(search_results) > FULL_EVALUATION_THRESHOLD:
+        ranked = [(item, _relevance(item, idx), idx) for idx, item in enumerate(search_results)]
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        ranked_candidates = [x[0] for x in ranked]
+        debug.reranked_top_titles = [x[0].title for x in ranked[:5]]
+
+    def _evaluate(items: List[SearchResult], mark_fallback: bool = False):
+        if mark_fallback:
+            debug.fallback_used = True
         for item in items:
+            dedup_key = item.link or item.title
+            if dedup_key and dedup_key in evaluated_links:
+                continue
+            if dedup_key:
+                evaluated_links.add(dedup_key)
+            debug.evaluated_candidate_count += 1
             matched, reason, similarity = evaluate_match(base.name, item.title)
             if not matched:
                 debug.dropped_count += 1
@@ -97,11 +140,18 @@ def compare_product_with_results(
                     is_problem=is_below,
                 )
             )
-
-    _evaluate(candidates)
-    if not compared and fallback_candidates:
-        _add_reason(debug, f"후보 fallback 재평가 {len(fallback_candidates)}건")
-        _evaluate(fallback_candidates)
+    # 못잡음 최소화를 위해 평가량을 넓게 가져감
+    if len(ranked_candidates) <= FULL_EVALUATION_THRESHOLD:
+        _evaluate(ranked_candidates)
+    else:
+        base_limit = max_evaluation_candidates or len(ranked_candidates)
+        primary_limit = min(len(ranked_candidates), max(base_limit * 3, 120))
+        primary_candidates = ranked_candidates[:primary_limit]
+        remaining_candidates = ranked_candidates[primary_limit:]
+        _evaluate(primary_candidates)
+        if not compared and remaining_candidates:
+            _add_reason(debug, f"후보 fallback 재평가 {len(remaining_candidates)}건")
+            _evaluate(remaining_candidates, mark_fallback=True)
 
     debug.passed_count = len(compared)
     if debug.dropped_count == 0 and debug.raw_count > 0:

@@ -283,8 +283,11 @@ def run_search():
             {
                 "product_name": product.name,
                 "raw_count": raw_count,
+                "evaluated_candidate_count": getattr(debug_info, "evaluated_candidate_count", 0),
                 "passed_count": debug_info.passed_count,
-                "dropped_count": max(raw_count - debug_info.passed_count, 0),
+                "dropped_count": getattr(debug_info, "dropped_count", 0),
+                "fallback_used": getattr(debug_info, "fallback_used", False),
+                "reranked_top_titles": getattr(debug_info, "reranked_top_titles", []),
                 "pages_called": pages_called,
                 "accumulated_raw_count": raw_count,
                 "reasons": debug_info.reasons,
