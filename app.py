@@ -9,7 +9,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 
 from config import Config
 from providers.naver_provider import NaverProvider
-from services.comparison import ComparisonResult, compare_product_with_results
+from services.comparison import ComparisonDebugInfo, ComparisonResult, compare_product_with_results
 from services.excel_reader import BaseProduct, ExcelReadError, PriceDebugRow, load_base_products
 from services.exporter import export_results_to_excel
 from services.matcher import get_evaluate_match_counter, reset_evaluate_match_counter
@@ -119,9 +119,38 @@ def run_search():
     app.logger.info("[RUN] 전체 품목 수=%s", len(products))
     reset_evaluate_match_counter()
 
-    for product in products:
+    for product_idx, product in enumerate(products):
+        # 1) 전체 실행 제한시간: run-search가 장시간 붙잡히지 않도록 남은 품목은 중단 처리
+        run_elapsed = perf_counter() - run_started_at
+        if run_elapsed >= Config.MAX_SECONDS_PER_RUN:
+            app.logger.warning(
+                "[RUN] 전체 제한시간 초과(%.3fs >= %ss): 남은 제품 중단",
+                run_elapsed,
+                Config.MAX_SECONDS_PER_RUN,
+            )
+            runtime_warnings.append(f"전체 검색 제한시간 초과({Config.MAX_SECONDS_PER_RUN}초): 남은 제품은 중단되었습니다.")
+            for pending_product in products[product_idx:]:
+                all_results.append(
+                    ComparisonResult(
+                        base_product_name=pending_product.name,
+                        base_online_discount_price=pending_product.online_discount_price,
+                        found_product_name="-",
+                        sale_price=None,
+                        mall_name="-",
+                        product_link="",
+                        is_below_base=False,
+                        shipping_fee_known=False,
+                        status="전체 제한시간 초과로 중단",
+                        is_problem=False,
+                    )
+                )
+            break
+
+        # 2) 제품별 실행 제한시간: 느린 품목 1개가 전체를 멈추지 않게 함
         search_started_at = perf_counter()
-        search_results = provider.search(product.name)
+        product_results: List[ComparisonResult] = []
+        debug_info = ComparisonDebugInfo(raw_count=0, passed_count=0, dropped_count=0, reasons={})
+        search_results = provider.search(product.name, max_seconds=Config.MAX_SECONDS_PER_PRODUCT)
         search_elapsed = perf_counter() - search_started_at
         raw_count = getattr(provider, "last_raw_count", len(search_results))
         pages_called = getattr(provider, "last_pages_called", 0)
@@ -138,15 +167,43 @@ def run_search():
         if provider_error and provider_error not in runtime_warnings:
             runtime_warnings.append(provider_error)
 
-        compare_started_at = perf_counter()
-        product_results, debug_info = compare_product_with_results(product, search_results)
-        compare_elapsed = perf_counter() - compare_started_at
-        app.logger.info(
-            "[PERF] product='%s' compare_product_with_results() 소요=%.3fs / evaluate 대상=%s",
-            product.name,
-            compare_elapsed,
-            len(search_results),
-        )
+        # provider 내부에서 timeout을 신호했거나, 실제 측정 시간이 상한을 넘으면 timeout 상태로 확정
+        if provider_error_type == "PRODUCT_TIMEOUT" or search_elapsed >= Config.MAX_SECONDS_PER_PRODUCT:
+            product_results = [
+                ComparisonResult(
+                    base_product_name=product.name,
+                    base_online_discount_price=product.online_discount_price,
+                    found_product_name="-",
+                    sale_price=None,
+                    mall_name="-",
+                    product_link="",
+                    is_below_base=False,
+                    shipping_fee_known=False,
+                    status="검색 시간 초과",
+                    is_problem=False,
+                )
+            ]
+            compare_elapsed = 0.0
+            app.logger.warning(
+                "[RUN] product timeout / product='%s' / elapsed=%.3fs",
+                product.name,
+                search_elapsed,
+            )
+            debug_info = ComparisonDebugInfo(raw_count=0, passed_count=0, dropped_count=0, reasons={"검색 시간 초과": 1})
+        else:
+            compare_started_at = perf_counter()
+            product_results, debug_info = compare_product_with_results(
+                product,
+                search_results,
+                max_evaluation_candidates=Config.MAX_MATCH_EVALUATION_CANDIDATES,
+            )
+            compare_elapsed = perf_counter() - compare_started_at
+            app.logger.info(
+                "[PERF] product='%s' compare_product_with_results() 소요=%.3fs / evaluate 대상=%s",
+                product.name,
+                compare_elapsed,
+                min(len(search_results), Config.MAX_MATCH_EVALUATION_CANDIDATES),
+            )
 
         # 상태성 행 생성 (검색 결과/필터 진단용)
         if provider_error_type == "API_RATE_LIMIT":
@@ -163,6 +220,21 @@ def run_search():
                     shipping_fee_known=False,
                     status="API 429 / 호출 제한",
                     is_problem=True,
+                )
+            ]
+        elif provider_error_type == "PRODUCT_TIMEOUT":
+            product_results = [
+                ComparisonResult(
+                    base_product_name=product.name,
+                    base_online_discount_price=product.online_discount_price,
+                    found_product_name="-",
+                    sale_price=None,
+                    mall_name="-",
+                    product_link="",
+                    is_below_base=False,
+                    shipping_fee_known=False,
+                    status="검색 시간 초과",
+                    is_problem=False,
                 )
             ]
         elif raw_count == 0:
@@ -211,8 +283,11 @@ def run_search():
             {
                 "product_name": product.name,
                 "raw_count": raw_count,
+                "evaluated_candidate_count": getattr(debug_info, "evaluated_candidate_count", 0),
                 "passed_count": debug_info.passed_count,
-                "dropped_count": max(raw_count - debug_info.passed_count, 0),
+                "dropped_count": getattr(debug_info, "dropped_count", 0),
+                "fallback_used": getattr(debug_info, "fallback_used", False),
+                "reranked_top_titles": getattr(debug_info, "reranked_top_titles", []),
                 "pages_called": pages_called,
                 "accumulated_raw_count": raw_count,
                 "reasons": debug_info.reasons,
@@ -224,8 +299,7 @@ def run_search():
             }
         )
 
-    # 기준제품명 단위 정렬(그룹핑 표시에 유리)
-    all_results.sort(key=lambda x: (x.base_product_name, x.found_product_name))
+    # source_order 유지: 업로드된 제품 순서대로 누적된 결과를 그대로 사용
 
     # 화면 상단 요약
     grouped = {}

@@ -12,7 +12,8 @@ class TodayHouseProvider(BaseProvider):
     def __init__(self, config: Config):
         self.config = config
 
-    def search(self, query: str) -> List[SearchResult]:
+    def search(self, query: str, max_seconds: float | None = None) -> List[SearchResult]:
+        _ = max_seconds
         if self.config.USE_MOCK:
             return self._search_mock(query)
         return self._search_real(query)
