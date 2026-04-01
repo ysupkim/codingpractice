@@ -20,5 +20,5 @@ class BaseProvider(ABC):
     name: str = "base"
 
     @abstractmethod
-    def search(self, query: str) -> List[SearchResult]:
+    def search(self, query: str, max_seconds: Optional[float] = None) -> List[SearchResult]:
         raise NotImplementedError

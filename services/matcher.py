@@ -58,17 +58,41 @@ NOISE_PATTERNS = [
     r"\[예단포장\]",
 ]
 
+# 자주 나오는 표기 변형/오탈자 정규화
+TYPO_NORMALIZATION_PAIRS = [
+    ("패일", "페일"),
+]
+
 PIECE_UNIT_PATTERN = r"(?:pieces|piece|pcs|pc|p)"
+
+# 차용품 액세서리/비본품 신호 토큰
+TEA_ACCESSORY_TOKENS = {
+    "차보관함",
+    "차판",
+    "보이차",
+    "찻잎",
+    "다도",
+}
+
+HARD_NEGATIVE_TOKENS = {
+    "방짜유기",
+    "육포",
+    "골프",
+    "마스크",
+    "티셔츠",
+    "정수기",
+    "종이컵",
+}
 
 # 세부 품목 타입
 ITEM_TYPE_GROUPS = {
     "coffee_set": ["커피세트", "커피셋"],
     "coffee_cup_set": ["커피잔세트", "커피컵세트"],
     "coffee_cup_single": ["커피잔", "커피컵"],
-    "mug_set": ["머그세트", "머그셋"],
-    "mug_single": ["머그", "머그컵"],
-    "lid_mug_set": ["뚜껑머그세트", "뚜껑머그셋"],
-    "lid_mug_single": ["뚜껑머그"],
+    "mug_set": ["머그세트", "머그셋", "엘머그세트", "엘머그셋"],
+    "mug_single": ["머그", "머그컵", "엘머그"],
+    "lid_mug_set": ["뚜껑머그세트", "뚜껑머그셋", "받침뚜껑머그세트", "뚜껑받침머그세트"],
+    "lid_mug_single": ["뚜껑머그", "받침뚜껑머그", "뚜껑받침머그", "받침머그"],
     "bansang": ["반상기"],
     "single_bansang": ["단반상기"],
     "tea_set": ["티세트", "티셋", "다기세트", "다기"],
@@ -149,6 +173,8 @@ class NameFeatures:
     bracket_parse_failed: bool
     years: Set[int]
     design_number_tokens: Set[str]
+    tea_accessory_tokens: Set[str]
+    hard_negative_tokens: Set[str]
 
 
 def _normalize_piece_units(text: str) -> str:
@@ -157,11 +183,17 @@ def _normalize_piece_units(text: str) -> str:
 
 def normalize_text(text: str) -> str:
     text = text.lower().strip()
+    for before, after in TYPO_NORMALIZATION_PAIRS:
+        text = text.replace(before, after)
     text = _normalize_piece_units(text)
     for pattern in NOISE_PATTERNS:
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
     text = re.sub(r"[^0-9a-zA-Z가-힣()\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
+    # 로마 숫자 표기 변형을 숫자로 통일 (ii/iii/iv)
+    text = re.sub(r"\biii\b", "3", text)
+    text = re.sub(r"\bii\b", "2", text)
+    text = re.sub(r"\biv\b", "4", text)
     return text.strip()
 
 
@@ -224,6 +256,22 @@ def _build_alias_list() -> List[str]:
     return sorted(aliases, key=len, reverse=True)
 
 
+def _extract_tea_accessory_tokens(text_no_space: str) -> Set[str]:
+    found: Set[str] = set()
+    for token in TEA_ACCESSORY_TOKENS:
+        if token and token in text_no_space:
+            found.add(token)
+    return found
+
+
+def _extract_hard_negative_tokens(text_no_space: str) -> Set[str]:
+    found: Set[str] = set()
+    for token in HARD_NEGATIVE_TOKENS:
+        if token and token in text_no_space:
+            found.add(token)
+    return found
+
+
 def extract_features(name: str) -> NameFeatures:
     norm = normalize_text(name)
     text_no_space = norm.replace(" ", "")
@@ -232,6 +280,8 @@ def extract_features(name: str) -> NameFeatures:
     person_counts = _extract_person_counts(norm)
     years = _extract_years(norm)
     item_type_tokens = _detect_item_types(text_no_space)
+    tea_accessory_tokens = _extract_tea_accessory_tokens(text_no_space)
+    hard_negative_tokens = _extract_hard_negative_tokens(text_no_space)
 
     raw_tokens = _tokenize_for_core(norm)
     shape_tokens = _extract_shape_tokens(raw_tokens, text_no_space)
@@ -306,6 +356,8 @@ def extract_features(name: str) -> NameFeatures:
         bracket_parse_failed=bracket_parse_failed,
         years=years,
         design_number_tokens=design_number_tokens,
+        tea_accessory_tokens=tea_accessory_tokens,
+        hard_negative_tokens=hard_negative_tokens,
     )
 
 
@@ -406,6 +458,10 @@ def evaluate_match(base_name: str, candidate_name: str, threshold: float = 0.42)
     base = extract_features(base_name)
     cand = extract_features(candidate_name)
 
+    # 비식기/비도자기 hard negative 후보는 강탈락
+    if cand.hard_negative_tokens:
+        return False, "비식기 hard negative", 0.0
+
     if cand.bracket_parse_failed:
         return False, "괄호형 피스 표기 해석 실패", 0.0
 
@@ -443,10 +499,18 @@ def evaluate_match(base_name: str, candidate_name: str, threshold: float = 0.42)
             return False, "쉐입 없음 후보 허용 실패", 0.0
         return False, "세부 품목 타입 불일치", 0.0
 
+    # 차용품 액세서리(차판/보관함/보이차 등)는 tea_set 본품으로 보지 않음
+    # - 디자인 토큰만 겹치는 오탐(예: 매난국죽) 차단용
+    # - piece/person 정보가 있는 정상 세트 후보는 살리기 위해 조건을 좁게 유지
+    if "tea_set" in base.item_type_tokens and cand.tea_accessory_tokens:
+        if not cand.piece_counts and not cand.person_counts:
+            return False, "차용품 액세서리 후보", 0.0
+
     # 기준에 쉐입 있고 후보에 쉐입이 없으면 추가 조건 필요(기존보다 완화)
     if base.shape_tokens and not cand.shape_tokens:
         strong_design_ok = _has_design_overlap(base.design_candidate_tokens, cand.design_candidate_tokens)
-        near_item_ok = bool(base.item_type_tokens & cand.item_type_tokens) if cand.item_type_tokens else False
+        # 교집합 기준은 coffee_set vs coffee_cup_set 같은 근접 타입을 과하게 탈락시킴
+        near_item_ok = _item_type_compatible(base.item_type_tokens, cand.item_type_tokens)
         piece_or_person_ok = False
         if base.piece_counts and cand.piece_counts and (base.piece_counts & cand.piece_counts):
             piece_or_person_ok = True
@@ -490,6 +554,11 @@ def evaluate_match(base_name: str, candidate_name: str, threshold: float = 0.42)
 
     if similarity < threshold_adjusted:
         if structure_score >= 3:
+            # recall 우선 보정:
+            # - 세트 구조가 강하게 맞는데(디자인/품목/수량) 노이즈 문구로 유사도만 낮은 경우를 통과
+            # - 적용 범위를 세트류로 제한해 오탐 확산을 억제
+            if base.item_type_tokens & {"home_set", "coffee_set", "coffee_cup_set", "bansang", "single_bansang", "tea_set"}:
+                return True, "통과", similarity
             return False, "세트 구조 일치했지만 threshold 부족", similarity
         return False, "세부 품목 타입이 너무 보수적", similarity
 
@@ -509,4 +578,4 @@ def reset_evaluate_match_counter() -> None:
 
 def get_evaluate_match_counter() -> int:
     """현재 evaluate_match 누적 호출 횟수를 반환합니다."""
-    return EVALUATE_MATCH_CALL_COUNT
+    return int(EVALUATE_MATCH_CALL_COUNT)

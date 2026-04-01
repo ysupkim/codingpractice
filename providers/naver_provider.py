@@ -42,14 +42,14 @@ class NaverProvider(BaseProvider):
         self.retry_count = 0
         self.api_raw_zero_count = 0
 
-    def search(self, query: str) -> List[SearchResult]:
+    def search(self, query: str, max_seconds: float | None = None) -> List[SearchResult]:
         self.last_error_message = ""
         self.last_error_type = ""
         self.last_raw_count = 0
         self.last_pages_called = 0
         if self.config.USE_MOCK:
             return self._search_mock(query)
-        return self._search_real(query)
+        return self._search_real(query, max_seconds=max_seconds)
 
     def _build_query_candidates(self, original_query: str) -> List[str]:
         """
@@ -73,14 +73,26 @@ class NaverProvider(BaseProvider):
 
         brand_prefixes = getattr(self.config, "SEARCH_BRAND_PREFIXES", []) or []
 
-        candidates: List[str] = [
-            base_query,
-            *[f"{brand} {base_query}".strip() for brand in brand_prefixes],
-            core_query,
-            *[f"{brand} {core_query}".strip() for brand in brand_prefixes],
-            core_with_qty,
-            *[f"{brand} {core_with_qty}".strip() for brand in brand_prefixes],
-        ]
+        # safe_fast에서는 후보 수를 최소화해서 "실행 완료 보장" 우선
+        if self.config.SEARCH_SPEED_MODE == "safe_fast":
+            first_brand = brand_prefixes[0] if brand_prefixes else ""
+            candidates: List[str] = [
+                base_query,  # 원본
+                f"{first_brand} {base_query}".strip() if first_brand else "",  # 브랜드 + 원본
+                core_query,  # 핵심 토큰
+                f"{first_brand} {core_query}".strip() if first_brand else "",  # 브랜드 + 핵심 토큰
+                core_with_qty,  # 핵심 토큰 + 수량
+                f"{first_brand} {core_with_qty}".strip() if first_brand else "",  # 브랜드 + 핵심 토큰 + 수량
+            ]
+        else:
+            candidates = [
+                base_query,
+                *[f"{brand} {base_query}".strip() for brand in brand_prefixes],
+                core_query,
+                *[f"{brand} {core_query}".strip() for brand in brand_prefixes],
+                core_with_qty,
+                *[f"{brand} {core_with_qty}".strip() for brand in brand_prefixes],
+            ]
 
         # 순서 유지 + 중복 제거
         dedup = []
@@ -90,10 +102,18 @@ class NaverProvider(BaseProvider):
                 dedup.append(q)
                 seen.add(q)
 
-        logger.info("[NAVER] query 후보 순서=%s", dedup)
-        return dedup
+        max_candidates = max(getattr(self.config, "NAVER_MAX_QUERY_CANDIDATES", 3), 1)
+        limited = dedup[:max_candidates]
+        logger.info("[NAVER] query 후보 순서(상한 적용)=%s", limited)
+        return limited
 
-    def _call_api_with_retry(self, query: str, start: int, headers: Dict[str, str]) -> Tuple[Dict, str]:
+    def _call_api_with_retry(
+        self,
+        query: str,
+        start: int,
+        headers: Dict[str, str],
+        deadline: float | None = None,
+    ) -> Tuple[Dict, str]:
         """429 대응: 지연 + 지수 백오프 재시도."""
         cache_key = f"{query}::start={start}"
         if cache_key in self._query_cache:
@@ -102,6 +122,11 @@ class NaverProvider(BaseProvider):
 
         last_error = ""
         for attempt in range(1, self.config.NAVER_MAX_RETRIES + 1):
+            if deadline is not None and time.perf_counter() >= deadline:
+                self.last_error_type = "PRODUCT_TIMEOUT"
+                self.last_error_message = "검색 시간 초과"
+                return {"total": 0, "items": []}, "TIMEOUT"
+
             # 요청 간 기본 지연
             time.sleep(self.config.NAVER_REQUEST_DELAY_MS / 1000.0)
 
@@ -156,7 +181,7 @@ class NaverProvider(BaseProvider):
         self.last_error_message = f"네이버 API 호출 실패: {last_error}"
         return {"total": 0, "items": []}, "ERROR"
 
-    def _search_real(self, query: str) -> List[SearchResult]:
+    def _search_real(self, query: str, max_seconds: float | None = None) -> List[SearchResult]:
         """
         [진짜 네이버 API 호출 부분]
         - 서버 환경변수(NAVER_CLIENT_ID/SECRET)만 사용
@@ -177,16 +202,29 @@ class NaverProvider(BaseProvider):
             "X-Naver-Client-Id": self.config.NAVER_CLIENT_ID,
             "X-Naver-Client-Secret": self.config.NAVER_CLIENT_SECRET,
         }
+        deadline = time.perf_counter() + max_seconds if max_seconds else None
 
         query_candidates = self._build_query_candidates(query)
         raw_items = []
         self.last_pages_called = 0
+        should_stop_search = False
 
         for idx, q in enumerate(query_candidates, start=1):
+            if deadline is not None and time.perf_counter() >= deadline:
+                self.last_error_type = "PRODUCT_TIMEOUT"
+                self.last_error_message = "검색 시간 초과"
+                logger.warning("[NAVER] 제품 제한시간 초과 / query=%s", query)
+                break
             logger.info("[NAVER] query 후보 시도 %s/%s: %s", idx, len(query_candidates), q)
             for page in range(1, max(self.config.NAVER_MAX_PAGES, 1) + 1):
+                if deadline is not None and time.perf_counter() >= deadline:
+                    self.last_error_type = "PRODUCT_TIMEOUT"
+                    self.last_error_message = "검색 시간 초과"
+                    should_stop_search = True
+                    logger.warning("[NAVER] 페이지 탐색 중 제품 제한시간 초과 / query=%s", query)
+                    break
                 start = 1 + (page - 1) * self.config.NAVER_DISPLAY_COUNT
-                payload, call_status = self._call_api_with_retry(q, start, headers)
+                payload, call_status = self._call_api_with_retry(q, start, headers, deadline=deadline)
                 self.last_pages_called += 1
 
                 total = payload.get("total", 0)
@@ -208,20 +246,43 @@ class NaverProvider(BaseProvider):
 
                 if call_status == "RATE_LIMIT":
                     break
+                if call_status == "TIMEOUT":
+                    should_stop_search = True
+                    break
+                if call_status == "ERROR":
+                    should_stop_search = True
+                    logger.warning("[NAVER] API ERROR 재발 방지: 남은 query/page 탐색 중단 / query=%s", query)
+                    break
 
                 raw_items.extend(items)
 
                 # 기본은 첫 페이지만, 충분한 후보가 없을 때만 다음 페이지
                 if page == 1 and len(items) >= 20:
-                    logger.info("[NAVER] 첫 페이지 후보 충분 -> 다음 페이지 생략")
-                    break
+                    # recall 우선: safe_fast에서도 최소 query 구간에서는 2페이지를 실제로 확인
+                    min_queries_to_try = max(getattr(self.config, "NAVER_MIN_QUERIES_TO_TRY", 1), 1)
+                    keep_page2 = self.config.SEARCH_SPEED_MODE == "safe_fast" and idx <= min(len(query_candidates), min_queries_to_try)
+                    if not keep_page2:
+                        logger.info("[NAVER] 첫 페이지 후보 충분 -> 다음 페이지 생략")
+                        break
                 if len(items) == 0:
                     break
 
             if getattr(self, "last_error_type", "") == "API_RATE_LIMIT":
                 break
+            if should_stop_search:
+                break
 
             if raw_items:
+                # recall 우선: safe_fast에서도 최소 query 횟수까지는 추가 시도
+                min_queries_to_try = max(getattr(self.config, "NAVER_MIN_QUERIES_TO_TRY", 1), 1)
+                if self.config.SEARCH_SPEED_MODE == "safe_fast" and idx < min(len(query_candidates), min_queries_to_try):
+                    logger.info(
+                        "[NAVER] safe_fast recall 보강: raw_items 존재하지만 추가 query 시도 계속 (%s/%s)",
+                        idx,
+                        min(len(query_candidates), min_queries_to_try),
+                    )
+                    continue
+
                 logger.info("[NAVER] 결과가 나온 query=%s", q)
                 break
 

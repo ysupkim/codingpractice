@@ -11,7 +11,8 @@ def export_results_to_excel(results: Iterable[ComparisonResult], only_problem: b
     if only_problem:
         filtered = [r for r in filtered if r.is_problem or r.status == "API 429 / 호출 제한"]
 
-    filtered.sort(key=lambda x: (x.base_product_name, x.found_product_name))
+    # run-search에서 만든 순서(=현재 source_order 의도)를 그대로 사용합니다.
+    # 별도 source_order 필드에 의존하지 않고, 전달된 리스트 순서를 신뢰합니다.
 
     rows = []
     for r in filtered:
